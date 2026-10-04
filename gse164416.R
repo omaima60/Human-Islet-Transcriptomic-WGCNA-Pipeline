@@ -1,6 +1,8 @@
 library(GEOquery)
 library(data.table)
 library(stringr)
+library(tidyverse)
+library(tidyr)
 library(dplyr)
 library(forcats)
 library(DESeq2)
@@ -8,9 +10,12 @@ library(EnhancedVolcano)
 library(pheatmap)
 library(ggplot2)
 library(ggrepel)
+library(ggpubr)
 library(clusterProfiler)
 library(org.Hs.eg.db)
 library(AnnotationDbi)
+library(enrichplot)
+library(WGCNA)
 
 # Download the series matrix
 gse <- getGEO("GSE164416", GSEMatrix = TRUE)
@@ -20,9 +25,6 @@ metadata <- pData(gse[[1]])
 
 colnames_to_keep <- c("title", "geo_accession", "diabetes status:ch1", "in_ins_filtered_data_subset:ch1")
 metadata_cl <- metadata[, colnames_to_keep, drop = FALSE]
-#in / ins / filtered_data_subset: Refers to whether a specific donor sample was retained in the primary analytical dataset or 
-#subset after performing quality control (QC) filtering on human islet samples (e.g., checks for RNA integrity, islet purity, 
-#insulin content/secretion, or read alignment thresholds).
 metadata_cl <- metadata_cl %>%
   rename(status = "diabetes status:ch1") %>%
   filter(`in_ins_filtered_data_subset:ch1` == "TRUE" | `in_ins_filtered_data_subset:ch1` == "1")
@@ -32,7 +34,7 @@ dp_ids <- str_extract(metadata_cl$title, "DP\\d+")
 # Inspect extracted IDs to ensure no NAs were produced
 head(dp_ids)
 
-# 2. Set the extracted DP IDs as the row names of metadata_cl
+# Set the extracted DP IDs as the row names of metadata_cl
 rownames(metadata_cl) <- dp_ids
 # Download the supplementary files using your GSE ID
 supp_files <- getGEOSuppFiles("GSE164416")
@@ -43,7 +45,7 @@ print(supp_files)
 # Define path to the downloaded counts file
 counts_path <- "/home/omaima/t2d_project/GSE164416/GSE164416/GSE164416_DP_htseq_counts.txt.gz"
 
-# Read table (R automatically decompresses .gz files)
+# Read table 
 counts_matrix <- read.delim(counts_path, header = TRUE, row.names = 1, check.names = FALSE)
 # Subset your count matrix to match
 counts_matrix <- counts_matrix[, rownames(metadata_cl)]
@@ -51,19 +53,17 @@ counts_matrix <- counts_matrix[, rownames(metadata_cl)]
 counts_matrix <- as.matrix(counts_matrix)
 mode(counts_matrix) <- "integer"
 
-# 5. Verify exact alignment (MUST return TRUE)
+# Verify exact alignment (MUST return TRUE)
 all(colnames(counts_matrix) == rownames(metadata_cl))
 
 library(DESeq2)
 
-# 1. Filter metadata to keep only ND and T2D samples
+# Filter metadata to keep only ND and T2D samples
 metadata_sub <- metadata_cl %>%
   filter(status %in% c("ND", "T2D")) %>%
   mutate(status = factor(status, levels = c("ND", "T2D")))
-# Option A: Relevel in metadata prior to DESeqDataSet
+# Relevel in metadata prior to DESeqDataSet
 metadata_sub$status <- relevel(metadata_sub$status, ref = "ND") 
-# (Replace "ND" with whatever your baseline group is named, e.g., "Control" or "non-diabetic")
-
 # Verify the baseline level comes first
 levels(metadata_sub$status)
 # Output should be: [1] "ND"  "T2D"
@@ -71,44 +71,44 @@ levels(metadata_sub$status)
 counts_sub <- counts_matrix[, rownames(metadata_sub)]
 all(colnames(counts_sub) == rownames(metadata_sub))
 
-# 1. Create DESeqDataSet object
+# Create DESeqDataSet object
 dds <- DESeqDataSetFromMatrix(
   countData = counts_sub,
   colData = metadata_sub,
   design = ~ status  # Replace 'status' with your condition variable name
 )
 
-# 2. Filter out low-count genes (improves speed and statistical power)
+# Filter out low-count genes (improves speed and statistical power)
 keep <- rowSums(counts(dds)) >= 10
 dds <- dds[keep, ]
 
-# 3. Run the DESeq2 pipeline
+# Run the DESeq2 pipeline
 dds <- DESeq(dds)
 
-# 4. Extract results for T2D vs ND (Control)
+# Extract results for T2D vs ND (Control)
 res <- results(dds, contrast = c("status", "T2D", "ND"))
 
 # Inspect top differentially expressed genes
 head(res)
 
-# 5. Sort by adjusted p-value and convert to a data frame
+# Sort by adjusted p-value and convert to a data frame
 res_deseq2_df <- as.data.frame(res[order(res$padj), ])
 
-# 6. Export results to your working directory
+# Export results to your working directory
 fwrite(res_deseq2_df, "GSE164416_DESeq2_final_results.tsv", sep = "\t", row.names = TRUE)
 
 # View your top differentially expressed entries!
 head(res_deseq2_df)
 
 # --- PCA Step ---
-# 1. Transform counts using Variance Stabilizing Transformation
+# Transform counts using Variance Stabilizing Transformation
 vsd <- vst(dds, blind = FALSE)
 
-# 2. Extract PCA data 
+# Extract PCA data 
 pcaData <- plotPCA(vsd, intgroup = c("status"), returnData = TRUE)
 percentVar <- round(100 * attr(pcaData, "percentVar")) 
 
-# 3. Create a custom plot with ggplot2 
+# Create a custom plot with ggplot2 
 pca_plot <- ggplot(pcaData, aes(PC1, PC2, color = status)) +
   geom_point(size = 4, alpha = 0.8) +
   xlab(paste0("PC1: ", percentVar[1], "% variance")) +
@@ -118,11 +118,11 @@ pca_plot <- ggplot(pcaData, aes(PC1, PC2, color = status)) +
   theme(plot.title = element_text(hjust = 0.5, face = "bold")) +
   ggtitle("PCA Plot of Bulk RNA-Seq Samples (GSE164416)")
 
-# 7. View and Save the plot
+# View and Save the plot
 print(pca_plot)
 ggsave("GSE164416_PCA_Plot.png", pca_plot, width = 7, height = 6, dpi = 300)
 
-# 1. Define thresholds
+# Define thresholds
 log2FC_threshold <- 1    # log2(2) = 1, meaning an absolute fold change >= 2
 padj_threshold   <- 0.05
 
@@ -140,7 +140,7 @@ names(keyvals.colour)[keyvals.colour == 'red']    <- 'Upregulated (log2FC > 1)'
 names(keyvals.colour)[keyvals.colour == 'blue']   <- 'Downregulated (log2FC < -1)'
 names(keyvals.colour)[keyvals.colour == 'grey30'] <- 'Not Significant'
 
-library(EnhancedVolcano)
+# EnhancedVolcano
 
 volcano_final <- EnhancedVolcano(
   res_deseq2_df,
@@ -156,13 +156,12 @@ volcano_final <- EnhancedVolcano(
 )
 
 ggsave("GSE164416_Volcano_Plot1.png", volcano_final, width = 25, height = 20, units = "cm")
-library(tidyverse)
 
-# 1. Convert row names into an explicit column
+# Convert row names into an explicit column
 res_deseq2_df <- res_deseq2_df %>%
   rownames_to_column(var = "Ensembl_ID")
 
-# 1. Identify top significant gene IDs
+# Identify top significant gene IDs
 sig_gene_ids <- res_deseq2_df %>%
   filter(!is.na(padj) & padj < 0.05 & abs(log2FoldChange) >= 1) %>%
   pull(Ensembl_ID) # or rownames
@@ -175,16 +174,16 @@ vst_sig <- vst_matrix[sig_gene_ids, ]
 
 # Verify matrix dimensions (rows = number of DEGs, cols = number of samples)
 dim(vst_sig)
-library(pheatmap)
+# pheatmap
 
-# 1. Scale rows (Z-score normalization)
+# Scale rows (Z-score normalization)
 vst_scaled <- t(scale(t(vst_sig)))
 
-# 2. Prepare sample metadata annotation bar
+# Prepare sample metadata annotation bar
 annotation_col <- data.frame(Status = metadata_sub$status)
 rownames(annotation_col) <- rownames(metadata_sub)
 
-# 3. Generate heatmap
+# Generate heatmap
 heatmap_final <- pheatmap(
   vst_scaled,
   annotation_col = annotation_col,
@@ -198,26 +197,21 @@ heatmap_final <- pheatmap(
 
 ggsave("GSE164416_Top_DEGs_Heatmap.png", heatmap_final, width = 18, height = 20, units = "cm")
 
-#for 30
-library(pheatmap)
-library(dplyr)
+# Strictly slice the top 50 genes by adjusted p-value
 
-# 1. Strictly slice the top 50 genes by adjusted p-value
-library(dplyr)
-
-# 1. Extract ONLY significant genes for enrichGO()
+# Extract ONLY significant genes for enrichGO()
 top50_genes <- res_deseq2_df %>%
   filter(!is.na(padj)) %>%
   arrange(padj) %>%
   slice_head(n = 50) %>%
   pull(Ensembl_ID)
 
-# 2. Extract matrix
+# Extract matrix
 vst_top50 <- assay(vsd)[top50_genes, ]
 
-# 3. Double-check row count in console (should print 50)
+# Double-check row count in console (should print 50)
 print(nrow(vst_top50))
-# 1. Map Ensembl IDs to Gene Symbols for the top 50
+# Map Ensembl IDs to Gene Symbols for the top 50
 gene_symbols <- mapIds(
   org.Hs.eg.db,
   keys      = rownames(vst_top50),
@@ -225,13 +219,13 @@ gene_symbols <- mapIds(
   keytype   = "ENSEMBL",
   multiVals = "first"
 )
-# 2. Replace missing symbols with original Ensembl IDs if mapping yields NA
+# Replace missing symbols with original Ensembl IDs if mapping yields NA
 labels_row <- ifelse(!is.na(gene_symbols), gene_symbols, rownames(vst_top50))
 # 4. Set up sample annotation
 annotation_col <- data.frame(Status = metadata_sub$status)
 rownames(annotation_col) <- colnames(vst_top50)
 
-# 5. Render scaled 50-gene heatmap
+# Render scaled 50-gene heatmap
 top_50 <- pheatmap(
   vst_top50,
   scale = "row",
@@ -249,12 +243,9 @@ ggsave("GSE164416_Top_50_Heatmap.png", top_50, width = 18, height = 20, units = 
 
 #GO Enrichment
 
-# 2. Convert Gene Symbols to Entrez IDs
+# Convert Gene Symbols to Entrez IDs
 #Run this in your console to verify what format sig_gene_ids
 head(sig_gene_ids)
-library(clusterProfiler)
-library(org.Hs.eg.db)
-
 # Convert Ensembl IDs directly to Entrez IDs
 gene_conversion <- bitr(
   sig_gene_ids,          # Pass your vector directly
@@ -287,23 +278,19 @@ fwrite(go_results_df, "GSE164414_GO_Biological_Processes.tsv", sep = "\t")
 # Plot top 10 enriched GO terms
 go_dotplot <- dotplot(go_results, showCategory = 10, title = "GO: Biological Processes Enrichment")
 ggsave("GSE164416_GO_Dotplot.png", go_dotplot, width = 16, height = 14, units = "cm")
-library(dplyr)
-library(clusterProfiler)
-library(org.Hs.eg.db)
-
-# 1. Extract Upregulated Ensembl IDs directly from the column
+# Extract Upregulated Ensembl IDs directly from the column
 up_genes <- res_deseq2_df %>%
   filter(!is.na(padj) & padj < 0.05 & log2FoldChange > 1) %>%
   pull(Ensembl_ID) %>%      # Replace Ensembl_ID with your actual column name if different
   sub("\\..*", "", .)       # Removes version tags like .1, .2 if present
 
-# 2. Extract Downregulated Ensembl IDs directly from the column
+# Extract Downregulated Ensembl IDs directly from the column
 down_genes <- res_deseq2_df %>%
   filter(!is.na(padj) & padj < 0.05 & log2FoldChange < -1) %>%
   pull(Ensembl_ID) %>%
   sub("\\..*", "", .)
 
-# 3. Convert both to Entrez IDs using bitr
+# Convert both to Entrez IDs using bitr
 up_entrez <- bitr(
   up_genes, 
   fromType = "ENSEMBL", 
@@ -323,7 +310,7 @@ gene_clusters <- list(
   Downregulated = down_entrez
 )
 
-# 2. Run Comparative GO Analysis
+# Run Comparative GO Analysis
 comp_go <- compareCluster(
   geneCluster   = gene_clusters, 
   fun           = "enrichGO", 
@@ -332,10 +319,10 @@ comp_go <- compareCluster(
   pAdjustMethod = "BH"
 )
 
-# 3. Make gene names readable in results
+# Make gene names readable in results
 comp_go <- setReadable(comp_go, OrgDb = org.Hs.eg.db, keyType = "ENTREZID")
 
-# 4. Plot comparative dotplot
+# Plot comparative dotplot
 dotplot(comp_go, showCategory = 10, title = "GO BP: Upregulated vs Downregulated in T2D")
 #check if it < 30
 length(down_entrez)
@@ -373,17 +360,10 @@ go_down <- setReadable(go_down, OrgDb = org.Hs.eg.db, keyType = "ENTREZID")
 # Check if terms emerge
 head(go_down)
 
-library(enrichplot)
-library(ggplot2)
-
 # Generate a dotplot of the downregulated terms
-library(clusterProfiler)
-library(ggplot2)
-
-# 1. Open a PNG graphics device to save the file
 png("GO_BP_Downregulated_T2D_Dotplot.png", width = 10, height = 8, units = "in", res = 300)
 
-# 2. Generate the dotplot (assigning it or calling it directly inside the device)
+# Generate the dotplot (assigning it or calling it directly inside the device)
 print(
   dotplot(go_down, showCategory = 6) +
     ggtitle("GO BP: Downregulated Pathways in T2D Islets") +
@@ -392,11 +372,8 @@ print(
       axis.text.y = element_text(size = 11, face = "bold")
     )
 )
-
-# 3. Close the device to finalize and write the image file to your folder
 dev.off()
 
-#udate comparative plot
 # Combine the updated lists
 gene_clusters <- list(
   Upregulated   = up_entrez, 
@@ -445,37 +422,33 @@ kegg_dotplot <- dotplot(kegg_results, showCategory = 10, title = "KEGG Pathway E
 ggsave("GSE164416_KEGG_Dotplot.png", kegg_dotplot, width = 16, height = 14, units = "cm")
 
 #WGCNA
-library(WGCNA)
-library(DESeq2)
-
-# 1. Create a full DESeqDataSet using your original, unfiltered data
-# (Replace 'full_counts' and 'full_metadata' with your actual starting variables)
+# Create a full DESeqDataSet using your original, unfiltered data
 dds_full <- DESeqDataSetFromMatrix(
   countData = counts_matrix,       
   colData   = metadata_cl,     
   design    = ~ 1                # Blind design is perfectly fine for WGCNA extraction
 )
-# 2. Filter out non-expressed genes to save memory
+# Filter out non-expressed genes to save memory
 keep <- rowSums(counts(dds_full)) >= 10
 dds_full <- dds_full[keep, ]
 
-# 3. Apply the Variance Stabilizing Transformation
+# Apply the Variance Stabilizing Transformation
 vsd_full <- vst(dds_full, blind = FALSE)
 options(stringsAsFactors = FALSE)
 
-# 1. Select top 8,000 most variable genes across samples
+# Select top 8,000 most variable genes across samples
 vst_mat    <- assay(vsd_full)
 gene_vars  <- apply(vst_mat, 1, var)
 top_genes  <- names(sort(gene_vars, decreasing = TRUE))[1:8000]
 datExpr    <- t(vst_mat[top_genes, ]) # Samples in ROWS, Genes in COLUMNS
 
-# 2. Check data integrity
+# Check data integrity
 gsg <- goodSamplesGenes(datExpr, verbose = 3)
 if (!gsg$allOK) {
   datExpr <- datExpr[gsg$goodSamples, gsg$goodGenes]
 }
 
-# 3. Cluster samples to detect macro outliers
+# Cluster samples to detect macro outliers
 sampleTree <- hclust(dist(datExpr), method = "average")
 
 par(cex = 0.6, mar = c(0, 4, 2, 0))
@@ -542,7 +515,7 @@ plot(
 text(sft$fitIndices[, 1], sft$fitIndices[, 5], labels = powers, cex = cex1, col = "red")
 # Filter traits metadata to match clean expression samples
 traits_clean <- metadata_cl[rownames(datExpr_clean), ]
-# 1. Enable parallel processing
+# Enable parallel processing
 enableWGCNAThreads()
 # Run blockwise module construction
 net <- blockwiseModules(
@@ -564,8 +537,7 @@ net <- blockwiseModules(
 table(net$colors)
 
 # Plot the dendrogram with module colors underneath
-
-# 2. Save as high-resolution PNG (For presentations/reports)
+# Save as high-resolution PNG (For presentations/reports)
 png("WGCNA_Module_Dendrogram1.png", width = 10, height = 6, units = "in", res = 300)
 plotDendroAndColors(
   net$dendrograms[[1]], 
@@ -579,33 +551,31 @@ plotDendroAndColors(
 )
 dev.off()
 
-library(dplyr)
-
-# 1. Convert status to factor
+# Convert status to factor
 status_factor <- as.factor(traits_clean$status)
 
 status_ordered <- factor(
   traits_clean$status, 
   levels = c("ND", "IFG", "IGT", "T2D", "T3cD")
 )
-# 2. Create one-hot encoded matrix for ND, IGT, T2D, and T3cD
+# Create one-hot encoded matrix for ND, IGT, T2D, and T3cD
 traits_numeric <- as.data.frame(model.matrix(~ 0 + status_ordered))
 rownames(traits_numeric) <- rownames(traits_clean)
 
-# 3. Clean up column names (removes "status_factor" prefix)
+# Clean up column names (removes "status_factor" prefix)
 colnames(traits_numeric) <- gsub("status_ordered", "", colnames(traits_numeric))
 
 # Verify the numeric traits matrix layout
 head(traits_numeric)
-# 1. Recalculate module eigengenes and order them
+# Recalculate module eigengenes and order them
 MEs0 <- moduleEigengenes(datExpr_clean, net$colors)$eigengenes
 MEs  <- orderMEs(MEs0)
 
-# 2. Calculate Pearson correlation & Student asymptotic p-values
+# Calculate Pearson correlation & Student asymptotic p-values
 moduleTraitCor   <- cor(MEs, traits_numeric, use = "p")
 moduleTraitPvalue <- corPvalueStudent(moduleTraitCor, nrow(datExpr_clean))
 
-# 3. Format text matrix for display (Correlation on top, P-value in parentheses)
+# Format text matrix for display (Correlation on top, P-value in parentheses)
 textMatrix <- paste(
   matrix(sprintf("%.2f", moduleTraitCor), nrow = nrow(moduleTraitCor)),
   "\n(",
@@ -615,7 +585,7 @@ textMatrix <- paste(
 )
 dim(textMatrix) <- dim(moduleTraitCor)
 
-# 4. Save and plot Module-Trait Relationship Heatmap
+# Save and plot Module-Trait Relationship Heatmap
 png("Module_Trait_Relationships_5Groups1.png", width = 8, height = 10, units = "in", res = 300)
 par(mar = c(6, 8.5, 3, 3))
 labeledHeatmap(
@@ -632,41 +602,25 @@ labeledHeatmap(
   main          = "Module-Trait Relationships Across Islet Status Groups"
 )
 dev.off()
-library(AnnotationDbi)
-library(org.Hs.eg.db)
 
-# 1. Extract current column names (Ensembl IDs) and strip version numbers (e.g., .1, .3)
+# Extract current column names (Ensembl IDs) and strip version numbers (e.g., .1, .3)
 ensg_ids <- colnames(datExpr_clean)
-ensg_clean <- gsub("\\..*", "", ensg_ids)
 
-# 2. Map Ensembl IDs to Gene Symbols using AnnotationDbi
-mapped_symbols <- mapIds(
-  org.Hs.eg.db,
-  keys = ensg_clean,
-  column = "SYMBOL",
-  keytype = "ENSEMBL",
-  multiVals = "first" # Takes the first symbol if multiple map to one ENSG
-)
-
-# 3. Handle missing symbols (keep original ENSG if no symbol is found)
+# Handle missing symbols (keep original ENSG if no symbol is found)
 final_names <- ifelse(is.na(mapped_symbols), ensg_ids, mapped_symbols)
 
-# 4. Make column names unique (prevents errors if two different ENSG IDs map to the same symbol)
+# Make column names unique (prevents errors if two different ENSG IDs map to the same symbol)
 final_names_unique <- make.unique(final_names)
 
-# 5. Assign the new gene symbols as the column names of your expression matrix
+# Assign the new gene symbols as the column names of your expression matrix
 colnames(datExpr_clean) <- final_names_unique
 
-# 6. Verify success
+# Verify success
 cat("Successfully mapped column names! Total columns:", ncol(datExpr_clean), "\n")
 print(head(colnames(datExpr_clean), 10))
 
 
-#This code compares Module Eigengenes (MEs) using an ANOVA across stages, runs Tukey's HSD post-hoc test for pairwise comparisons
-library(WGCNA)
-library(dplyr)
-library(ggplot2)
-library(tidyr)
+#for comparing Module Eigengenes (MEs) using an ANOVA across stages, runs Tukey's HSD post-hoc test for pairwise comparisons
 
 # Ensure status is an ordered factor
 traits_clean$status <- factor(
@@ -677,9 +631,8 @@ traits_clean$status <- factor(
 # Combine Module Eigengenes with clinical status
 me_trait_df <- cbind(MEs, Status = traits_clean$status)
 
-# ----------------------------------------------------------------------
-# 1. ANOVA Across 5 Stages for All Modules
-# ----------------------------------------------------------------------
+# ANOVA Across 5 Stages for All Modules
+
 anova_results <- data.frame(Module = colnames(MEs), p_value = NA, f_statistic = NA)
 
 for (i in 1:ncol(MEs)) {
@@ -698,36 +651,24 @@ anova_results <- anova_results %>% arrange(p_value)
 cat("--- ANOVA Results Across 5 Islet Stages ---\n")
 print(anova_results)
 
-# ----------------------------------------------------------------------
-# 2. Pairwise Post-Hoc Comparison (Tukey HSD) for Key Modules
-# ----------------------------------------------------------------------
+# Pairwise Post-Hoc Comparison (Tukey HSD) for Key Modules
+
 # Run Tukey HSD for MEyellow and MEblue
 tukey_yellow <- TukeyHSD(aov(MEyellow ~ Status, data = me_trait_df))
-tukey_blue   <- TukeyHSD(aov(MEblue ~ Status, data = me_trait_df))
 tukey_yellow_df <- as.data.frame(tukey_yellow$Status)
 tukey_yellow_df$Comparison <- rownames(tukey_yellow_df)
 rownames(tukey_yellow_df) <- NULL
 write.csv(tukey_yellow_df, file = "Ranked_Hub_Genes_MEyellow.csv", row.names = FALSE)
-# 2. Move row names (the pairwise comparisons like T2D-ND) into a clean column
-# 1. Convert to data.frame
-tukey_blue_df <- as.data.frame(tukey_blue$Status)
 
-# 2. Create the Comparison column from row names FIRST
+tukey_blue   <- TukeyHSD(aov(MEblue ~ Status, data = me_trait_df))
+tukey_blue_df <- as.data.frame(tukey_blue$Status)
 tukey_blue_df$Comparison <- rownames(tukey_blue_df)
 rownames(tukey_blue_df) <- NULL # Clear row names
-
-# 3. NOW you can reorder because "Comparison" exists
 tukey_blue_df <- tukey_blue_df[, c("Comparison", "diff", "lwr", "upr", "p adj")]
-
-# 4. Save to CSV
 write.csv(tukey_blue_df, file = paste0("Ranked_Hub_Genes_ME", target_module, ".csv"), row.names = FALSE)
 
+# Visualization: Boxplots of Module Eigengenes Across Stages
 
-
-
-# ----------------------------------------------------------------------
-# 3. Visualization: Boxplots of Module Eigengenes Across Stages
-# ----------------------------------------------------------------------
 me_long <- me_trait_df %>%
   dplyr::select(Status, MEyellow, MEblue, MEturquoise, MEgreen) %>%
   pivot_longer(cols = starts_with("ME"), names_to = "Module", values_to = "Eigengene")
@@ -747,9 +688,8 @@ ggplot(me_long, aes(x = Status, y = Eigengene, fill = Status)) +
   theme(legend.position = "none", plot.title = element_text(hjust = 0.5, face = "bold"))
 dev.off()
 
-# ----------------------------------------------------------------------
-# 4. Group-Specific Mean Eigengenes Matrix
-# ----------------------------------------------------------------------
+# Group-Specific Mean Eigengenes Matrix
+
 stage_means <- me_trait_df %>%
   group_by(Status) %>%
   summarise(across(starts_with("ME"), mean)) %>%
@@ -759,10 +699,8 @@ cat("\n--- Mean Eigengene Value Per Stage ---\n")
 print(stage_means)
 
 #heatmap
-library(pheatmap)
-library(dplyr)
 
-# 1. Format the data frame for pheatmap (Stages as columns, Modules as rows)
+# Format the data frame for pheatmap (Stages as columns, Modules as rows)
 plot_matrix <- stage_means %>%
   dplyr::select(-MEgrey) %>%                  # Exclude unassigned grey module
   tibble::column_to_rownames("Status") %>%
@@ -771,7 +709,7 @@ plot_matrix <- stage_means %>%
 # Clean row labels (remove 'ME' prefix)
 rownames(plot_matrix) <- gsub("^ME", "", rownames(plot_matrix))
 
-# 2. Plot publication-quality heatmap
+# Plot publication-quality heatmap
 png("Mean_Module_Eigengene_Heatmap_5Stages1.png", width = 7, height = 8, units = "in", res = 300)
 Mean_Module <- pheatmap(
   plot_matrix,
@@ -788,16 +726,7 @@ dev.off()
 
 
 #To determine the single best hub gene to focus on for downstream experimental validation
-library(WGCNA)
-library(dplyr)
-library(ggrepel)
-library(AnnotationDbi)
-library(org.Hs.eg.db)
-library(WGCNA)
-library(dplyr)
-
-
-# 3. Create a clean data frame of your hub gene ranking with mapped symbols
+# Create a clean data frame of your hub gene ranking with mapped symbols
 datKME <- signedKME(datExpr_clean, MEs)
 GS_T2D <- as.data.frame(cor(datExpr_clean, traits_numeric$T2D, use = "p"))
 colnames(GS_T2D) <- "GS_T2D"
@@ -823,17 +752,13 @@ hub_ranking_df <- data.frame(
 cat(paste0("--- Top 10 Hub Genes for ME", target_module, " (with Symbols) ---\n"))
 print(head(hub_ranking_df, 10))
 
-# 4. Optional: If you want to rename your expression matrix columns permanently to symbols 
-# (handling duplicate or missing symbols safely):
-# colnames(datExpr_clean) <- make.unique(ifelse(is.na(gene_mapping), ensg_clean_version, gene_mapping))
-
 # Save the full ranked list for your study
 write.csv(hub_ranking_df, file = paste0("Hub_Genes_ME", target_module, ".csv"), row.names = FALSE)
 
-# 2. Select top genes to label (e.g., top 10 instead of top 5, or filter for specific ones)
+# Select top genes to label (e.g., top 10 instead of top 5, or filter for specific ones)
 top_genes_to_label <- head(hub_ranking_df, 10)
 
-# 3. Generate Publication-Quality Scatter Plot with Non-Overlapping Labels
+# Generate Scatter Plot with Non-Overlapping Labels
 png(paste0("MM_vs_GS_Scatter_ME", target_module, "_CleanLabels.png"), width = 9, height = 7, units = "in", res = 300)
 ggplot(hub_ranking_df, aes(x = MM, y = GS_T2D, color = Is_Hub)) +
   geom_point(alpha = 0.5, size = 2) +
@@ -866,11 +791,7 @@ ggplot(hub_ranking_df, aes(x = MM, y = GS_T2D, color = Is_Hub)) +
   )
 dev.off()
 
-library(ggplot2)
-library(dplyr)
-library(ggpubr) # Optional: for adding p-value brackets easily
-
-# 1. Choose your hub gene of interest (replace with your target, e.g., "INS", "GCG", "PDX1")
+# Choose your hub gene of interest (replace with your target, e.g., "INS", "GCG", "PDX1")
 gene_of_interest <- "ATP6V1A" 
 
 # Check if the gene exists in your dataset
@@ -878,22 +799,22 @@ if (!(gene_of_interest %in% colnames(datExpr_clean))) {
   stop(paste("Gene", gene_of_interest, "not found in datExpr_clean columns! Check spelling or gene symbols."))
 }
 
-# 2. Create a data frame combining expression values and clinical status
+# Create a data frame combining expression values and clinical status
 gene_expr_df <- data.frame(
   Expression = datExpr_clean[, gene_of_interest],
   Status = factor(traits_clean$status, levels = c("ND", "IFG", "IGT", "T2D", "T3cD"))
 )
 
-# 3. Perform One-Way ANOVA to test overall significance across stages
+# Perform One-Way ANOVA to test overall significance across stages
 anova_fit <- aov(Expression ~ Status, data = gene_expr_df)
 anova_summary <- summary(anova_fit)
 print(anova_summary)
 
-# 4. Perform Tukey's HSD Post-Hoc Test for pairwise group comparisons
+# Perform Tukey's HSD Post-Hoc Test for pairwise group comparisons
 tukey_results <- TukeyHSD(anova_fit)
 print(tukey_results)
 
-# 5. Calculate summary statistics (mean, SD, median) per stage for reporting
+# Calculate summary statistics (mean, SD, median) per stage for reporting
 stage_stats <- gene_expr_df %>%
   group_by(Status) %>%
   summarise(
@@ -906,7 +827,7 @@ stage_stats <- gene_expr_df %>%
 cat("\n--- Summary Statistics per Stage ---\n")
 print(stage_stats)
 
-# 6. Generate Publication-Quality Boxplot / Violin Plot
+# Generate Publication-Quality Boxplot / Violin Plot
 png(paste0("HubGene_Expression_", gene_of_interest, "_5Stages.png"), width = 8, height = 6, units = "in", res = 300)
 ggplot(gene_expr_df, aes(x = Status, y = Expression, fill = Status)) +
   geom_violin(alpha = 0.4, trim = FALSE) +
