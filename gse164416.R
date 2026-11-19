@@ -1,8 +1,6 @@
 library(GEOquery)
 library(data.table)
 library(stringr)
-library(tidyverse)
-library(tidyr)
 library(dplyr)
 library(forcats)
 library(DESeq2)
@@ -10,841 +8,707 @@ library(EnhancedVolcano)
 library(pheatmap)
 library(ggplot2)
 library(ggrepel)
-library(ggpubr)
 library(clusterProfiler)
 library(org.Hs.eg.db)
 library(AnnotationDbi)
-library(enrichplot)
-library(WGCNA)
 
-# Download the series matrix
 gse <- getGEO("GSE164416", GSEMatrix = TRUE)
-
-# Extract metadata (colData for DESeq2)
 metadata <- pData(gse[[1]])
 
-colnames_to_keep <- c("title", "geo_accession", "diabetes status:ch1", "in_ins_filtered_data_subset:ch1")
-metadata_cl <- metadata[, colnames_to_keep, drop = FALSE]
-metadata_cl <- metadata_cl %>%
-  rename(status = "diabetes status:ch1") %>%
-  filter(`in_ins_filtered_data_subset:ch1` == "TRUE" | `in_ins_filtered_data_subset:ch1` == "1")
-# 1. Extract the "DP" followed by digits (e.g., "DP170", "DP002") from the title column
-dp_ids <- str_extract(metadata_cl$title, "DP\\d+")
+colnames_to_keep <- c(
+  "title",
+  "geo_accession",
+  "diabetes status:ch1",
+  "in_ins_filtered_data_subset:ch1"
+)
 
-# Inspect extracted IDs to ensure no NAs were produced
-head(dp_ids)
+metadata_cl <- metadata[, colnames_to_keep, drop = FALSE] %>%
+  dplyr::rename(status = `diabetes status:ch1`) %>%
+  dplyr::filter(`in_ins_filtered_data_subset:ch1` %in% c("TRUE", "1")) %>%
+  mutate(dp_id = str_extract(title, "DP\\d+"))
 
-# Set the extracted DP IDs as the row names of metadata_cl
-rownames(metadata_cl) <- dp_ids
-# Download the supplementary files using your GSE ID
+stopifnot(!anyNA(metadata_cl$dp_id), !anyDuplicated(metadata_cl$dp_id))
+rownames(metadata_cl) <- metadata_cl$dp_id
+# 2. Download supplementary files and locate the HTSeq counts file dynamically
 supp_files <- getGEOSuppFiles("GSE164416")
+print(rownames(supp_files))
 
-# Print the file paths to see what was downloaded
-print(supp_files)
+counts_matches <- grep("htseq_counts\\.txt\\.gz$", rownames(supp_files), value = TRUE)
+stopifnot(length(counts_matches) >= 1)
+counts_path <- counts_matches[1]
 
-# Define path to the downloaded counts file
-counts_path <- "/home/omaima/t2d_project/GSE164416/GSE164416/GSE164416_DP_htseq_counts.txt.gz"
+# 3. Read, align, and validate integer count matrix
+counts_df <- read.delim(counts_path, header = TRUE, row.names = 1, check.names = FALSE)
 
-# Read table 
-counts_matrix <- read.delim(counts_path, header = TRUE, row.names = 1, check.names = FALSE)
-# Subset your count matrix to match
-counts_matrix <- counts_matrix[, rownames(metadata_cl)]
-# Convert to integer matrix for DESeq2
-counts_matrix <- as.matrix(counts_matrix)
-mode(counts_matrix) <- "integer"
+missing_samples <- setdiff(rownames(metadata_cl), colnames(counts_df))
+if (length(missing_samples) > 0) {
+  stop("Missing samples in counts_df: ", paste(missing_samples, collapse = ", "))
+}
 
-# Verify exact alignment (MUST return TRUE)
+counts_matrix <- as.matrix(counts_df[, rownames(metadata_cl), drop = FALSE])
+storage.mode(counts_matrix) <- "integer"
+
+stopifnot(
+  !anyNA(counts_matrix),
+  all(colnames(counts_matrix) == rownames(metadata_cl))
+)
+
+# 5. Verify exact alignment (MUST return TRUE)
 all(colnames(counts_matrix) == rownames(metadata_cl))
 
-library(DESeq2)
-
-# Filter metadata to keep only ND and T2D samples
-metadata_sub <- metadata_cl %>%
-  filter(status %in% c("ND", "T2D")) %>%
-  mutate(status = factor(status, levels = c("ND", "T2D")))
-# Relevel in metadata prior to DESeqDataSet
-metadata_sub$status <- relevel(metadata_sub$status, ref = "ND") 
-# Verify the baseline level comes first
-levels(metadata_sub$status)
-# Output should be: [1] "ND"  "T2D"
-# 2. Subset count matrix columns to match the filtered metadata rows
-counts_sub <- counts_matrix[, rownames(metadata_sub)]
-all(colnames(counts_sub) == rownames(metadata_sub))
-
-# Create DESeqDataSet object
+# 1. Create a full DESeqDataSet using your original, unfiltered data (WGCNA, PCA)
+# (Replace 'full_counts' and 'full_metadata' with your actual starting variables)
 dds <- DESeqDataSetFromMatrix(
-  countData = counts_sub,
-  colData = metadata_sub,
-  design = ~ status  # Replace 'status' with your condition variable name
-)
-
-# Filter out low-count genes (improves speed and statistical power)
-keep <- rowSums(counts(dds)) >= 10
-dds <- dds[keep, ]
-
-# Run the DESeq2 pipeline
-dds <- DESeq(dds)
-
-# Extract results for T2D vs ND (Control)
-res <- results(dds, contrast = c("status", "T2D", "ND"))
-
-# Inspect top differentially expressed genes
-head(res)
-
-# Sort by adjusted p-value and convert to a data frame
-res_deseq2_df <- as.data.frame(res[order(res$padj), ])
-
-# Export results to your working directory
-fwrite(res_deseq2_df, "GSE164416_DESeq2_final_results.tsv", sep = "\t", row.names = TRUE)
-
-# View your top differentially expressed entries!
-head(res_deseq2_df)
-
-# --- PCA Step ---
-# Transform counts using Variance Stabilizing Transformation
-vsd <- vst(dds, blind = FALSE)
-
-# Extract PCA data 
-pcaData <- plotPCA(vsd, intgroup = c("status"), returnData = TRUE)
-percentVar <- round(100 * attr(pcaData, "percentVar")) 
-
-# Create a custom plot with ggplot2 
-pca_plot <- ggplot(pcaData, aes(PC1, PC2, color = status)) +
-  geom_point(size = 4, alpha = 0.8) +
-  xlab(paste0("PC1: ", percentVar[1], "% variance")) +
-  ylab(paste0("PC2: ", percentVar[2], "% variance")) +
-  coord_fixed() +
-  theme_minimal() +
-  theme(plot.title = element_text(hjust = 0.5, face = "bold")) +
-  ggtitle("PCA Plot of Bulk RNA-Seq Samples (GSE164416)")
-
-# View and Save the plot
-print(pca_plot)
-ggsave("GSE164416_PCA_Plot.png", pca_plot, width = 7, height = 6, dpi = 300)
-
-# Define thresholds
-log2FC_threshold <- 1    # log2(2) = 1, meaning an absolute fold change >= 2
-padj_threshold   <- 0.05
-
-
-keyvals.colour <- ifelse(
-  (res_deseq2_df$log2FoldChange < -log2FC_threshold & res_deseq2_df$padj < padj_threshold), 'blue',
-  ifelse((res_deseq2_df$log2FoldChange > log2FC_threshold & res_deseq2_df$padj < padj_threshold), 'red', 'grey30')
-)
-
-# Convert NAs (from independent filtering) to grey30
-keyvals.colour[is.na(keyvals.colour)] <- 'grey30'
-
-# Assign labels for the legend
-names(keyvals.colour)[keyvals.colour == 'red']    <- 'Upregulated (log2FC > 1)'
-names(keyvals.colour)[keyvals.colour == 'blue']   <- 'Downregulated (log2FC < -1)'
-names(keyvals.colour)[keyvals.colour == 'grey30'] <- 'Not Significant'
-
-# EnhancedVolcano
-
-volcano_final <- EnhancedVolcano(
-  res_deseq2_df,
-  lab = rownames(res_deseq2_df),  # Keep lab non-NULL so geom_text gets its aesthetic
-  selectLab = c(""),               # Selects no genes, effectively removing all labels
-  x = 'log2FoldChange',
-  y = 'padj',
-  colCustom = keyvals.colour,
-  pCutoff = padj_threshold,
-  FCcutoff = log2FC_threshold,
-  title = "T2D vs ND Islets",
-  subtitle = "Volcano Plot"
-)
-
-ggsave("GSE164416_Volcano_Plot1.png", volcano_final, width = 25, height = 20, units = "cm")
-
-# Convert row names into an explicit column
-res_deseq2_df <- res_deseq2_df %>%
-  rownames_to_column(var = "Ensembl_ID")
-
-# Identify top significant gene IDs
-sig_gene_ids <- res_deseq2_df %>%
-  filter(!is.na(padj) & padj < 0.05 & abs(log2FoldChange) >= 1) %>%
-  pull(Ensembl_ID) # or rownames
-
-# Extract the normalized expression matrix from vsd
-vst_matrix <- assay(vsd)
-
-# Subset matrix for your significant genes
-vst_sig <- vst_matrix[sig_gene_ids, ]
-
-# Verify matrix dimensions (rows = number of DEGs, cols = number of samples)
-dim(vst_sig)
-# pheatmap
-
-# Scale rows (Z-score normalization)
-vst_scaled <- t(scale(t(vst_sig)))
-
-# Prepare sample metadata annotation bar
-annotation_col <- data.frame(Status = metadata_sub$status)
-rownames(annotation_col) <- rownames(metadata_sub)
-
-# Generate heatmap
-heatmap_final <- pheatmap(
-  vst_scaled,
-  annotation_col = annotation_col,
-  show_colnames  = FALSE,         # Hides long sample IDs
-  show_rownames  = TRUE,          # Displays gene IDs/symbols
-  clustering_distance_rows = "euclidean",
-  clustering_distance_cols = "euclidean",
-  clustering_method = "complete",
-  main = "Top DEGs Heatmap (T2D vs ND)"
-)
-
-ggsave("GSE164416_Top_DEGs_Heatmap.png", heatmap_final, width = 18, height = 20, units = "cm")
-
-# Strictly slice the top 50 genes by adjusted p-value
-
-# Extract ONLY significant genes for enrichGO()
-top50_genes <- res_deseq2_df %>%
-  filter(!is.na(padj)) %>%
-  arrange(padj) %>%
-  slice_head(n = 50) %>%
-  pull(Ensembl_ID)
-
-# Extract matrix
-vst_top50 <- assay(vsd)[top50_genes, ]
-
-# Double-check row count in console (should print 50)
-print(nrow(vst_top50))
-# Map Ensembl IDs to Gene Symbols for the top 50
-gene_symbols <- mapIds(
-  org.Hs.eg.db,
-  keys      = rownames(vst_top50),
-  column    = "SYMBOL",
-  keytype   = "ENSEMBL",
-  multiVals = "first"
-)
-# Replace missing symbols with original Ensembl IDs if mapping yields NA
-labels_row <- ifelse(!is.na(gene_symbols), gene_symbols, rownames(vst_top50))
-# 4. Set up sample annotation
-annotation_col <- data.frame(Status = metadata_sub$status)
-rownames(annotation_col) <- colnames(vst_top50)
-
-# Render scaled 50-gene heatmap
-top_50 <- pheatmap(
-  vst_top50,
-  scale = "row",
-  annotation_col = annotation_col,
-  labels_row = labels_row,          # Displays gene symbols
-  show_colnames = FALSE,            # Keep sample IDs hidden for cleanliness
-  show_rownames = TRUE,             # Display row labels
-  fontsize_row = 7,                 # Crisp font size for 50 genes
-  clustering_distance_rows = "euclidean",
-  clustering_distance_cols = "euclidean",
-  clustering_method = "complete",
-  main = "Top 50 Differentially Expressed Genes (T2D vs ND)"
-)
-ggsave("GSE164416_Top_50_Heatmap.png", top_50, width = 18, height = 20, units = "cm", bg = "white")
-
-#GO Enrichment
-
-# Convert Gene Symbols to Entrez IDs
-#Run this in your console to verify what format sig_gene_ids
-head(sig_gene_ids)
-# Convert Ensembl IDs directly to Entrez IDs
-gene_conversion <- bitr(
-  sig_gene_ids,          # Pass your vector directly
-  fromType = "ENSEMBL",  # Match input format
-  toType   = "ENTREZID", 
-  OrgDb    = org.Hs.eg.db
-)
-
-# Extract clean, unique Entrez IDs
-entrez_ids <- unique(gene_conversion$ENTREZID)
-
-# Verify conversion output
-head(gene_conversion)
-length(entrez_ids)
-# Run GO Enrichment
-go_results <- enrichGO(
-  gene          = entrez_ids,
-  OrgDb         = org.Hs.eg.db,
-  ont           = "BP",           # "BP" = Biological Process, "MF" = Molecular Function, "CC" = Cellular Component
-  pAdjustMethod = "BH",           # Benjamini-Hochberg false discovery rate correction
-  pvalueCutoff  = 0.05,
-  qvalueCutoff  = 0.05,
-  readable      = TRUE            # Converts numeric Entrez IDs back to readable Gene Symbols in the final table
-)
-
-# Save GO results table
-go_results_df <- as.data.frame(go_results)
-fwrite(go_results_df, "GSE164414_GO_Biological_Processes.tsv", sep = "\t")
-
-# Plot top 10 enriched GO terms
-go_dotplot <- dotplot(go_results, showCategory = 10, title = "GO: Biological Processes Enrichment")
-ggsave("GSE164416_GO_Dotplot.png", go_dotplot, width = 16, height = 14, units = "cm")
-# Extract Upregulated Ensembl IDs directly from the column
-up_genes <- res_deseq2_df %>%
-  filter(!is.na(padj) & padj < 0.05 & log2FoldChange > 1) %>%
-  pull(Ensembl_ID) %>%      # Replace Ensembl_ID with your actual column name if different
-  sub("\\..*", "", .)       # Removes version tags like .1, .2 if present
-
-# Extract Downregulated Ensembl IDs directly from the column
-down_genes <- res_deseq2_df %>%
-  filter(!is.na(padj) & padj < 0.05 & log2FoldChange < -1) %>%
-  pull(Ensembl_ID) %>%
-  sub("\\..*", "", .)
-
-# Convert both to Entrez IDs using bitr
-up_entrez <- bitr(
-  up_genes, 
-  fromType = "ENSEMBL", 
-  toType   = "ENTREZID", 
-  OrgDb    = org.Hs.eg.db
-)$ENTREZID
-
-down_entrez <- bitr(
-  down_genes, 
-  fromType = "ENSEMBL", 
-  toType   = "ENTREZID", 
-  OrgDb    = org.Hs.eg.db
-)$ENTREZID
-# 1. Combine into a named list
-gene_clusters <- list(
-  Upregulated   = up_entrez, 
-  Downregulated = down_entrez
-)
-
-# Run Comparative GO Analysis
-comp_go <- compareCluster(
-  geneCluster   = gene_clusters, 
-  fun           = "enrichGO", 
-  OrgDb         = org.Hs.eg.db, 
-  ont           = "BP",
-  pAdjustMethod = "BH"
-)
-
-# Make gene names readable in results
-comp_go <- setReadable(comp_go, OrgDb = org.Hs.eg.db, keyType = "ENTREZID")
-
-# Plot comparative dotplot
-dotplot(comp_go, showCategory = 10, title = "GO BP: Upregulated vs Downregulated in T2D")
-#check if it < 30
-length(down_entrez)
-# Check if any terms passed for Downregulated prior to plotting filtering
-as.data.frame(comp_go) %>% filter(Cluster == "Downregulated")
-#was 31 so relax threfold
-# Extract broader list of downregulated genes
-down_genes <- res_deseq2_df %>%
-  filter(!is.na(padj) & padj < 0.05 & log2FoldChange < -0.58) %>%
-  pull(Ensembl_ID) %>%
-  sub("\\..*", "", .)
-
-# Convert to Entrez IDs
-down_entrez <- bitr(
-  down_genes, 
-  fromType = "ENSEMBL", 
-  toType   = "ENTREZID", 
-  OrgDb    = org.Hs.eg.db
-)$ENTREZID
-
-# Check revised size (aim for > 100 genes)
-length(down_entrez)
-go_down <- enrichGO(
-  gene          = down_entrez,
-  OrgDb         = org.Hs.eg.db,
-  keyType       = "ENTREZID",
-  ont           = "BP",
-  pAdjustMethod = "BH",
-  pvalueCutoff  = 0.1
-)
-
-# Convert to readable gene symbols
-go_down <- setReadable(go_down, OrgDb = org.Hs.eg.db, keyType = "ENTREZID")
-
-# Check if terms emerge
-head(go_down)
-
-# Generate a dotplot of the downregulated terms
-png("GO_BP_Downregulated_T2D_Dotplot.png", width = 10, height = 8, units = "in", res = 300)
-
-# Generate the dotplot (assigning it or calling it directly inside the device)
-print(
-  dotplot(go_down, showCategory = 6) +
-    ggtitle("GO BP: Downregulated Pathways in T2D Islets") +
-    theme(
-      plot.title = element_text(hjust = 0.5, face = "bold", size = 14),
-      axis.text.y = element_text(size = 11, face = "bold")
-    )
-)
-dev.off()
-
-# Combine the updated lists
-gene_clusters <- list(
-  Upregulated   = up_entrez, 
-  Downregulated = down_entrez
-)
-
-# Run Comparative GO
-comp_go <- compareCluster(
-  geneCluster   = gene_clusters, 
-  fun           = "enrichGO", 
-  OrgDb         = org.Hs.eg.db, 
-  ont           = "BP",
-  pAdjustMethod = "BH",
-  pvalueCutoff  = 0.1       # Ensures downregulated terms are included
-)
-
-# Render gene symbols
-comp_go <- setReadable(comp_go, OrgDb = org.Hs.eg.db, keyType = "ENTREZID")
-
-# Save or display clean dotplot showing both directions
-dotplot(comp_go, showCategory = 8, title = "GO BP: Divergent Pathways in T2D Islets")
-# Save as PNG (High-res raster for presentations)
-ggsave(
-  filename = "GO_BP_Divergent_Pathways_T2D.png", 
-  plot     = last_plot(), 
-  width    = 9, 
-  height   = 8, 
-  dpi      = 300
-)
-# Run KEGG Enrichment (Requires "hsa" for Homo sapiens organism code)
-kegg_results <- enrichKEGG(
-  gene         = entrez_ids,
-  organism     = 'hsa',
-  pvalueCutoff = 0.05
-)
-
-# Convert IDs to readable symbols for the KEGG table export
-kegg_results <- setReadable(kegg_results, OrgDb = org.Hs.eg.db, keyType = "ENTREZID")
-
-# Save KEGG results table
-kegg_results_df <- as.data.frame(kegg_results)
-fwrite(kegg_results_df, "GSE164416_KEGG_Pathways.tsv", sep = "\t")
-
-# Plot top 10 enriched KEGG pathways
-kegg_dotplot <- dotplot(kegg_results, showCategory = 10, title = "KEGG Pathway Enrichment")
-ggsave("GSE164416_KEGG_Dotplot.png", kegg_dotplot, width = 16, height = 14, units = "cm")
-
-#WGCNA
-# Create a full DESeqDataSet using your original, unfiltered data
-dds_full <- DESeqDataSetFromMatrix(
   countData = counts_matrix,       
   colData   = metadata_cl,     
   design    = ~ 1                # Blind design is perfectly fine for WGCNA extraction
 )
-# Filter out non-expressed genes to save memory
-keep <- rowSums(counts(dds_full)) >= 10
-dds_full <- dds_full[keep, ]
+# 2. Filter out non-expressed genes to save memory
+keep <- rowSums(counts(dds) >= 10) >= 10
+dds <- dds[keep, ]
+# 2. Compute Variance Stabilizing Transformation for PCA and heatmaps
+vsd <- vst(dds, blind = FALSE)
+vst_mat  <- assay(vsd)
 
-# Apply the Variance Stabilizing Transformation
-vsd_full <- vst(dds_full, blind = FALSE)
-options(stringsAsFactors = FALSE)
+# 2. Extract PCA coordinates across all 92 QC-passed samples
+pcaData_full <- plotPCA(vsd, intgroup = c("status"), returnData = TRUE)
+percentVar_full <- round(100 * attr(pcaData_full, "percentVar"))
 
-# Select top 8,000 most variable genes across samples
-vst_mat    <- assay(vsd_full)
-gene_vars  <- apply(vst_mat, 1, var)
-top_genes  <- names(sort(gene_vars, decreasing = TRUE))[1:8000]
-datExpr    <- t(vst_mat[top_genes, ]) # Samples in ROWS, Genes in COLUMNS
-
-# Check data integrity
-gsg <- goodSamplesGenes(datExpr, verbose = 3)
-if (!gsg$allOK) {
-  datExpr <- datExpr[gsg$goodSamples, gsg$goodGenes]
+# Optional: order status levels for a logical legend
+desired_order <- c("ND", "IFG", "IGT", "T2D", "T3cD")
+present_levels <- desired_order[desired_order %in% unique(as.character(pcaData_full$status))]
+if (length(present_levels) > 0) {
+  pcaData_full$status <- factor(pcaData_full$status, levels = present_levels)
 }
 
-# Cluster samples to detect macro outliers
+# 3. Plot all status groups
+pca_full_plot <- ggplot(pcaData_full, aes(PC1, PC2, color = status)) +
+  geom_point(size = 4, alpha = 0.85) +
+  xlab(paste0("PC1: ", percentVar_full[1], "% variance")) +
+  ylab(paste0("PC2: ", percentVar_full[2], "% variance")) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    legend.position = "right"
+  ) +
+  ggtitle("PCA Plot Across All QC-Passed Islet Samples (GSE164416, n = 92)")
+
+print(pca_full_plot)
+ggsave("GSE164416_PCA_All_Samples.png", pca_full_plot, width = 8, height = 6, dpi = 300)
+
+library(WGCNA)
+
+options(stringsAsFactors = FALSE)
+allowWGCNAThreads()
+
+# 2. Select top variable genes (safely capped at available genes)
+gene_vars <- apply(vst_mat, 1, var, na.rm = TRUE)
+n_top     <- min(8000, length(gene_vars))
+top_genes <- names(sort(gene_vars, decreasing = TRUE))[seq_len(n_top)]
+datExpr   <- t(vst_mat[top_genes, , drop = FALSE]) # Samples in rows, genes in columns
+
+# 3. Check data integrity
+gsg <- goodSamplesGenes(datExpr, verbose = 3)
+if (!gsg$allOK) {
+  datExpr <- datExpr[gsg$goodSamples, gsg$goodGenes, drop = FALSE]
+}
+
+# 4. Inspect sample clustering tree before deciding on a cut height
 sampleTree <- hclust(dist(datExpr), method = "average")
 
-par(cex = 0.6, mar = c(0, 4, 2, 0))
+par(mfrow = c(1, 1), mar = c(4, 4, 2, 1))
 plot(
-  sampleTree, 
-  main = "Sample Clustering to Detect Outliers", 
-  sub  = "", 
-  xlab = "", 
-  ylab = "Height"
+  sampleTree,
+  main = "Sample Clustering to Detect Outliers (GSE164416)",
+  sub  = "",
+  xlab = "",
+  cex  = 0.6
 )
-
-# Plot tree with a horizontal cutoff line
-par(cex = 0.6, mar = c(0, 4, 2, 0))
-plot(sampleTree, main = "Sample Clustering Outlier Cutoff0", sub="", xlab="", ylab="Height")
 abline(h = 85, col = "red", lty = 2)
 
-# Determine clusters under the cut height
+# Optional: apply cutoff only after visually verifying h = 85 fits your tree
 clust <- cutreeStatic(sampleTree, cutHeight = 85, minSize = 10)
-table(clust) # Clust 1 contains main samples, Clust 0 contains outliers
+print(table(clust))
 
-# Keep only the main cluster samples
-keepSamples <- (clust == 1)
-datExpr_clean <- datExpr[keepSamples, ]
+keepSamples   <- rownames(datExpr) != "DP088"
+datExpr_clean <- datExpr[keepSamples, , drop = FALSE]
 
-# Verify removed samples
 removed_samples <- rownames(datExpr)[!keepSamples]
-cat("Removed Outlier Samples:", paste(removed_samples, collapse = ", "), "\n")
-# Define candidate powers
-powers <- c(c(1:10), seq(from = 12, to = 20, by = 2))
+cat("Removed samples:", paste(removed_samples, collapse = ", "), "\n")
+cat("Remaining samples in datExpr_clean:", nrow(datExpr_clean), "\n")
 
-# Evaluate scale-free topology fit
+# 2. Align metadata strictly to datExpr_clean (91 rows)
+meta_wgcna <- metadata_cl[rownames(datExpr_clean), , drop = FALSE]
+stopifnot(all(rownames(datExpr_clean) == rownames(meta_wgcna)))
+
+# 3. Soft-thresholding power selection for a signed network
+powers <- c(1:10, seq(from = 12, to = 24, by = 2))
 sft <- pickSoftThreshold(
-  datExpr_clean, 
-  powerVector = powers, 
-  verbose = 5,
+  datExpr_clean,
+  powerVector = powers,
+  verbose     = 5,
   networkType = "signed"
 )
 
-# Plot Scale-Free Topology Fit & Mean Connectivity
-par(mfrow = c(1, 2))
+# 4. Plot scale-free topology fit and mean connectivity
+par(mfrow = c(1, 2), mar = c(4, 4, 2, 1))
 cex1 <- 0.9
 
-# Fit Index vs Power
 plot(
-  sft$fitIndices[, 1], 
+  sft$fitIndices[, 1],
   -sign(sft$fitIndices[, 3]) * sft$fitIndices[, 2],
   xlab = "Soft Threshold (power)",
   ylab = "Scale Free Topology Model Fit, signed R^2",
   type = "n",
-  main = "Scale Independence"
+  main = "Scale independence"
 )
-text(sft$fitIndices[, 1], -sign(sft$fitIndices[, 3]) * sft$fitIndices[, 2], labels = powers, cex = cex1, col = "red")
-abline(h = 0.85, col = "blue", lty = 2)
+text(
+  sft$fitIndices[, 1],
+  -sign(sft$fitIndices[, 3]) * sft$fitIndices[, 2],
+  labels = powers,
+  cex = cex1,
+  col = "red"
+)
+abline(h = 0.80, col = "red", lty = 2)
 
-# Mean Connectivity vs Power
 plot(
-  sft$fitIndices[, 1], 
+  sft$fitIndices[, 1],
   sft$fitIndices[, 5],
   xlab = "Soft Threshold (power)",
   ylab = "Mean Connectivity",
   type = "n",
-  main = "Mean Connectivity"
+  main = "Mean connectivity"
 )
-text(sft$fitIndices[, 1], sft$fitIndices[, 5], labels = powers, cex = cex1, col = "red")
-# Filter traits metadata to match clean expression samples
-traits_clean <- metadata_cl[rownames(datExpr_clean), ]
-# Enable parallel processing
-enableWGCNAThreads()
-# Run blockwise module construction
+text(
+  sft$fitIndices[, 1],
+  sft$fitIndices[, 5],
+  labels = powers,
+  cex = cex1,
+  col = "red"
+)
+
+# 5. Select soft power (check plot first; use powerEstimate if available)
+softPower <- 6
+
+# 6. Construct signed co-expression modules
+set.seed(42)
 net <- blockwiseModules(
   datExpr_clean,
-  power = 8,
-  networkType = "signed",
-  corType = "bicor",                  # Biweight midcorrelation (robust to remaining outliers)
-  maxBlockSize = 10000,               # Ensures all 8,000 genes are processed in 1 block
-  minModuleSize = 30,                 # Minimum size for a gene module
-  remergeCutHeight = 0.25,            # Merges modules with >80% eigengene correlation
-  numericLabels = FALSE,
+  power             = softPower,
+  TOMType           = "signed",
+  networkType       = "signed",
+  minModuleSize     = 30,
+  reassignThreshold = 0,
+  mergeCutHeight    = 0.25,
+  numericLabels     = FALSE,
   pamRespectsDendro = FALSE,
-  saveTOMs = TRUE,
-  saveTOMFileBase = "GSE164416_TOM",
-  verbose = 3
+  saveTOMs          = TRUE,
+  saveTOMFileBase   = "GSE164416_WGCNA_TOM_n91",
+  verbose           = 3
 )
 
-# View module sizes (number of genes per module color)
-table(net$colors)
+print(table(net$colors))
 
-# Plot the dendrogram with module colors underneath
-# Save as high-resolution PNG (For presentations/reports)
-png("WGCNA_Module_Dendrogram1.png", width = 10, height = 6, units = "in", res = 300)
-plotDendroAndColors(
-  net$dendrograms[[1]], 
-  net$colors[net$blockGenes[[1]]],
-  "Module colors",
-  dendroLabels = FALSE, 
-  hang = 0.03,
-  addGuide = TRUE, 
-  guideHang = 0.05,
-  main = "Cluster Dendrogram & Co-expression Modules"
-)
-dev.off()
-
-# Convert status to factor
-status_factor <- as.factor(traits_clean$status)
-
-status_ordered <- factor(
-  traits_clean$status, 
-  levels = c("ND", "IFG", "IGT", "T2D", "T3cD")
-)
-# Create one-hot encoded matrix for ND, IGT, T2D, and T3cD
-traits_numeric <- as.data.frame(model.matrix(~ 0 + status_ordered))
-rownames(traits_numeric) <- rownames(traits_clean)
-
-# Clean up column names (removes "status_factor" prefix)
-colnames(traits_numeric) <- gsub("status_ordered", "", colnames(traits_numeric))
-
-# Verify the numeric traits matrix layout
-head(traits_numeric)
-# Recalculate module eigengenes and order them
-MEs0 <- moduleEigengenes(datExpr_clean, net$colors)$eigengenes
+# Module eigengenes (91 samples)
+MEs0 <- moduleEigengenes(datExpr_clean, colors = net$colors)$eigengenes
 MEs  <- orderMEs(MEs0)
 
-# Calculate Pearson correlation & Student asymptotic p-values
-moduleTraitCor   <- cor(MEs, traits_numeric, use = "p")
-moduleTraitPvalue <- corPvalueStudent(moduleTraitCor, nrow(datExpr_clean))
+# Build numeric trait matrix from meta_wgcna (status indicators + numeric traits if present)
+status_vec <- factor(meta_wgcna$status)
+trait_df   <- as.data.frame(model.matrix(~ 0 + status_vec))
+colnames(trait_df) <- sub("^status_vec", "status_", colnames(trait_df))
 
-# Format text matrix for display (Correlation on top, P-value in parentheses)
-textMatrix <- paste(
-  matrix(sprintf("%.2f", moduleTraitCor), nrow = nrow(moduleTraitCor)),
-  "\n(",
-  matrix(sprintf("%.2e", moduleTraitPvalue), nrow = nrow(moduleTraitPvalue)),
-  ")",
-  sep = ""
+# Optional: append any numeric clinical/QC columns if present in meta_wgcna
+num_cols <- sapply(meta_wgcna, is.numeric)
+if (any(num_cols)) {
+  trait_df <- cbind(trait_df, meta_wgcna[, num_cols, drop = FALSE])
+}
+
+nSamples <- nrow(datExpr_clean)
+moduleTraitCor    <- cor(MEs, trait_df, use = "p")
+moduleTraitPvalue <- corPvalueStudent(moduleTraitCor, nSamples)
+
+# Plot module-trait heatmap
+# Build clean display labels (correlation + p-value on two lines)
+textMatrix <- paste0(
+  sprintf("%.2f", moduleTraitCor), "\n",
+  "(p=", format.pval(moduleTraitPvalue, digits = 2, eps = 0.001), ")"
 )
 dim(textMatrix) <- dim(moduleTraitCor)
 
-# Save and plot Module-Trait Relationship Heatmap
-png("Module_Trait_Relationships_5Groups1.png", width = 8, height = 10, units = "in", res = 300)
-par(mar = c(6, 8.5, 3, 3))
+# Save high-resolution, spacious figure
+png("GSE164416_WGCNA_ModuleTrait_Clean.png", width = 12, height = 8, units = "in", res = 300)
+par(mar = c(10, 11, 4, 3), cex = 1.0)
+
 labeledHeatmap(
   Matrix        = moduleTraitCor,
-  xLabels       = names(traits_numeric),
-  yLabels       = names(MEs),
-  ySymbols      = names(MEs),
+  xLabels       = colnames(trait_df),
+  yLabels       = colnames(MEs),
+  ySymbols      = colnames(MEs),
   colorLabels   = FALSE,
   colors        = blueWhiteRed(50),
   textMatrix    = textMatrix,
   setStdMargins = FALSE,
-  cex.text      = 0.6,
+  cex.text      = 0.75,
+  cex.lab.x     = 0.95,
+  cex.lab.y     = 0.95,
   zlim          = c(-1, 1),
-  main          = "Module-Trait Relationships Across Islet Status Groups"
+  main          = "Module-Trait Relationships (GSE164416, n = 91)"
 )
+
 dev.off()
 
-# Extract current column names (Ensembl IDs) and strip version numbers (e.g., .1, .3)
-ensg_ids <- colnames(datExpr_clean)
-
-# Handle missing symbols (keep original ENSG if no symbol is found)
-final_names <- ifelse(is.na(mapped_symbols), ensg_ids, mapped_symbols)
-
-# Make column names unique (prevents errors if two different ENSG IDs map to the same symbol)
-final_names_unique <- make.unique(final_names)
-
-# Assign the new gene symbols as the column names of your expression matrix
-colnames(datExpr_clean) <- final_names_unique
-
-# Verify success
-cat("Successfully mapped column names! Total columns:", ncol(datExpr_clean), "\n")
-print(head(colnames(datExpr_clean), 10))
+# Also print exact numbers to console for quick reference
+print(round(moduleTraitCor, 3))
+print(signif(moduleTraitPvalue, 3))
 
 
-#for comparing Module Eigengenes (MEs) using an ANOVA across stages, runs Tukey's HSD post-hoc test for pairwise comparisons
+library(pheatmap)
 
-# Ensure status is an ordered factor
-traits_clean$status <- factor(
-  traits_clean$status, 
-  levels = c("ND", "IFG", "IGT", "T2D", "T3cD")
+# 1. Select key non-grey modules showing significant status associations
+key_modules <- c("brown", "turquoise", "blue", "yellow")
+present_mods <- key_modules[key_modules %in% unique(net$colors)]
+
+# 2. Compute signed module eigengene connectivity (kME) for all genes in datExpr_clean
+kME_df <- signedKME(datExpr_clean, MEs, outputColumnName = "kME_")
+
+# 3. Extract top 25 hub/member genes per selected module by |kME|
+selected_genes <- unique(unlist(lapply(present_mods, function(mod) {
+  mod_genes <- colnames(datExpr_clean)[net$colors == mod]
+  kme_col   <- paste0("kME", mod)
+  if (kme_col %in% colnames(kME_df) && length(mod_genes) > 0) {
+    scores <- abs(kME_df[mod_genes, kme_col])
+    mod_genes[order(scores, decreasing = TRUE)][seq_len(min(25, length(mod_genes)))]
+  } else {
+    mod_genes[seq_len(min(25, length(mod_genes)))]
+  }
+})))
+
+cat("Total genes selected for all-sample heatmap:", length(selected_genes), "\n")
+
+# 4. Prepare matrix (genes in rows, 91 samples in columns) ordered by status
+desired_order  <- c("ND", "IFG", "IGT", "T2D", "T3cD")
+present_levels <- desired_order[desired_order %in% unique(as.character(meta_wgcna$status))]
+status_ordered <- factor(meta_wgcna$status, levels = present_levels)
+
+col_order  <- order(status_ordered)
+hm_mat_ord <- t(datExpr_clean[col_order, selected_genes, drop = FALSE])
+
+ann_col <- data.frame(
+  status = status_ordered[col_order],
+  row.names = colnames(hm_mat_ord)
 )
 
-# Combine Module Eigengenes with clinical status
-me_trait_df <- cbind(MEs, Status = traits_clean$status)
+gene_mod_vec <- net$colors[rownames(hm_mat_ord)]
+ann_row <- data.frame(
+  module = factor(gene_mod_vec, levels = present_mods),
+  row.names = rownames(hm_mat_ord)
+)
 
-# ANOVA Across 5 Stages for All Modules
+# 5. Plot row-scaled VST all-sample heatmap
+pheatmap(
+  hm_mat_ord,
+  scale          = "row",
+  cluster_cols   = FALSE,
+  cluster_rows   = TRUE,
+  show_colnames  = FALSE,
+  show_rownames  = FALSE,
+  annotation_col = ann_col,
+  annotation_row = ann_row,
+  fontsize       = 10,
+  main           = paste0("WGCNA Key Module Genes Across Cohort (n = ", ncol(hm_mat_ord), ")"),
+  filename       = "GSE164416_AllSamples_WGCNA_Heatmap.png",
+  width          = 11,
+  height         = 8
+)
 
-anova_results <- data.frame(Module = colnames(MEs), p_value = NA, f_statistic = NA)
 
-for (i in 1:ncol(MEs)) {
-  mod_name <- colnames(MEs)[i]
-  fit <- aov(me_trait_df[[mod_name]] ~ Status, data = me_trait_df)
-  summary_fit <- summary(fit)[[1]]
-  
-  anova_results$p_value[i] <- summary_fit["Status", "Pr(>F)"]
-  anova_results$f_statistic[i] <- summary_fit["Status", "F value"]
+
+# Helper to strip Ensembl version suffixes if IDs look like ENSG...
+clean_ids <- function(x) {
+  sub("\\.[0-9]+$", "", as.character(x))
 }
 
-# Adjust p-values for multiple testing
-anova_results$FDR <- p.adjust(anova_results$p_value, method = "BH")
-anova_results <- anova_results %>% arrange(p_value)
+# Detect whether gene IDs are Ensembl or SYMBOL
+sample_ids <- clean_ids(colnames(datExpr_clean))
+is_ensembl <- mean(grepl("^ENSG", sample_ids)) > 0.5
+from_type  <- if (is_ensembl) "ENSEMBL" else "SYMBOL"
+cat("Detected WGCNA gene ID type:", from_type, "\n")
 
-cat("--- ANOVA Results Across 5 Islet Stages ---\n")
-print(anova_results)
-
-# Pairwise Post-Hoc Comparison (Tukey HSD) for Key Modules
-
-# Run Tukey HSD for MEyellow and MEblue
-tukey_yellow <- TukeyHSD(aov(MEyellow ~ Status, data = me_trait_df))
-tukey_yellow_df <- as.data.frame(tukey_yellow$Status)
-tukey_yellow_df$Comparison <- rownames(tukey_yellow_df)
-rownames(tukey_yellow_df) <- NULL
-write.csv(tukey_yellow_df, file = "Ranked_Hub_Genes_MEyellow.csv", row.names = FALSE)
-
-tukey_blue   <- TukeyHSD(aov(MEblue ~ Status, data = me_trait_df))
-tukey_blue_df <- as.data.frame(tukey_blue$Status)
-tukey_blue_df$Comparison <- rownames(tukey_blue_df)
-rownames(tukey_blue_df) <- NULL # Clear row names
-tukey_blue_df <- tukey_blue_df[, c("Comparison", "diff", "lwr", "upr", "p adj")]
-write.csv(tukey_blue_df, file = paste0("Ranked_Hub_Genes_ME", target_module, ".csv"), row.names = FALSE)
-
-# Visualization: Boxplots of Module Eigengenes Across Stages
-
-me_long <- me_trait_df %>%
-  dplyr::select(Status, MEyellow, MEblue, MEturquoise, MEgreen) %>%
-  pivot_longer(cols = starts_with("ME"), names_to = "Module", values_to = "Eigengene")
-
-png("Module_Eigengene_5Stage_Comparison1.png", width = 10, height = 7, units = "in", res = 300)
-ggplot(me_long, aes(x = Status, y = Eigengene, fill = Status)) +
-  geom_boxplot(alpha = 0.7, outlier.shape = NA) +
-  geom_jitter(width = 0.2, size = 1.5, alpha = 0.6) +
-  facet_wrap(~ Module, scales = "free_y", ncol = 2) +
-  theme_bw(base_size = 14) +
-  scale_fill_brewer(palette = "Set2") +
-  labs(
-    title = "Module Eigengene Dynamics Across 5 Islet Stages",
-    x = "Islet Phenotype Stage",
-    y = "Module Eigengene Value"
-  ) +
-  theme(legend.position = "none", plot.title = element_text(hjust = 0.5, face = "bold"))
-dev.off()
-
-# Group-Specific Mean Eigengenes Matrix
-
-stage_means <- me_trait_df %>%
-  group_by(Status) %>%
-  summarise(across(starts_with("ME"), mean)) %>%
-  as.data.frame()
-
-cat("\n--- Mean Eigengene Value Per Stage ---\n")
-print(stage_means)
-
-#heatmap
-
-# Format the data frame for pheatmap (Stages as columns, Modules as rows)
-plot_matrix <- stage_means %>%
-  dplyr::select(-MEgrey) %>%                  # Exclude unassigned grey module
-  tibble::column_to_rownames("Status") %>%
-  t()                                  # Transpose so modules are rows
-
-# Clean row labels (remove 'ME' prefix)
-rownames(plot_matrix) <- gsub("^ME", "", rownames(plot_matrix))
-
-# Plot publication-quality heatmap
-png("Mean_Module_Eigengene_Heatmap_5Stages1.png", width = 7, height = 8, units = "in", res = 300)
-Mean_Module <- pheatmap(
-  plot_matrix,
-  cluster_rows = TRUE,                 # Hierarchically cluster modules by mean expression
-  cluster_cols = FALSE,                # Keep stages in fixed biological order
-  color = colorRampPalette(c("#313695", "#4575b4", "#e0f3f8", "#fee090", "#f46d43", "#a50026"))(100),
-  display_numbers = TRUE,              # Overlay numeric values on cells
-  number_format = "%.3f",
-  fontsize_number = 9,
-  angle_col = 0,
-  main = "Mean Module Eigengene Across Islet Stages"
+# 1. Map all WGCNA genes to Entrez IDs to form the background universe
+bg_map <- bitr(
+  unique(sample_ids),
+  fromType = from_type,
+  toType   = c("ENTREZID", "SYMBOL"),
+  OrgDb    = org.Hs.eg.db
 )
-dev.off()
+universe_entrez <- unique(na.omit(bg_map$ENTREZID))
+cat("Background universe size (Entrez IDs):", length(universe_entrez), "\n")
 
+# 2. Target modules (focusing on key status-associated modules + all non-grey modules)
+target_mods <- intersect(c("brown", "turquoise", "blue", "yellow"), unique(net$colors))
+if (length(target_mods) == 0) {
+  target_mods <- setdiff(unique(net$colors), "grey")
+}
 
-#To determine the single best hub gene to focus on for downstream experimental validation
-# Create a clean data frame of your hub gene ranking with mapped symbols
-datKME <- signedKME(datExpr_clean, MEs)
-GS_T2D <- as.data.frame(cor(datExpr_clean, traits_numeric$T2D, use = "p"))
-colnames(GS_T2D) <- "GS_T2D"
-
-target_module <- "yellow" # or "blue"
-module_indices <- which(net$colors == target_module)
-module_ensg <- colnames(datExpr_clean)[module_indices]
-
-hub_ranking_df <- data.frame(
-  Ensembl_ID = module_ensg,
-  Symbol = gene_mapping[gsub("\\..*", "", module_ensg)],
-  Module = target_module,
-  MM = datKME[module_ensg, paste0("kME", target_module)],
-  GS_T2D = abs(GS_T2D[module_ensg, "GS_T2D"])
+# Build gene-to-module table and map to Entrez IDs
+mod_gene_df <- data.frame(
+  raw_id = colnames(datExpr_clean),
+  clean_id = sample_ids,
+  module = net$colors,
+  stringsAsFactors = FALSE
 ) %>%
-  # Define strict thresholds for a true hub gene (e.g., MM > 0.8 and GS > 0.3)
-  mutate(
-    Composite_Score = (MM + GS_T2D) / 2,
-    Is_Hub = (MM > 0.8 & GS_T2D > 0.3)
-  ) %>%
-  arrange(desc(Composite_Score))
+  filter(module %in% target_mods) %>%
+  left_join(bg_map, by = c("clean_id" = from_type)) %>%
+  filter(!is.na(ENTREZID)) %>%
+  distinct(module, ENTREZID, .keep_all = TRUE)
 
-cat(paste0("--- Top 10 Hub Genes for ME", target_module, " (with Symbols) ---\n"))
-print(head(hub_ranking_df, 10))
+# 3. Run GO (BP) and KEGG per module with universe
+go_list   <- list()
+kegg_list <- list()
 
-# Save the full ranked list for your study
-write.csv(hub_ranking_df, file = paste0("Hub_Genes_ME", target_module, ".csv"), row.names = FALSE)
-
-# Select top genes to label (e.g., top 10 instead of top 5, or filter for specific ones)
-top_genes_to_label <- head(hub_ranking_df, 10)
-
-# Generate Scatter Plot with Non-Overlapping Labels
-png(paste0("MM_vs_GS_Scatter_ME", target_module, "_CleanLabels.png"), width = 9, height = 7, units = "in", res = 300)
-ggplot(hub_ranking_df, aes(x = MM, y = GS_T2D, color = Is_Hub)) +
-  geom_point(alpha = 0.5, size = 2) +
-  scale_color_manual(values = c("gray70", "firebrick")) +
-  theme_bw(base_size = 14) +
-  labs(
-    title = paste("Module Membership vs. Gene Significance: ME", target_module),
-    subtitle = "Top Hub Drivers with Optimized Non-Overlapping Labels",
-    x = paste("Module Membership (MM in ME", target_module, ")"),
-    y = "Gene Significance (GS for T2D, |cor|)"
-  ) +
-  # geom_text_repel automatically pushes labels apart and draws connector lines
-  geom_text_repel(
-    data = top_genes_to_label,
-    aes(label = Symbol),
-    size = 4,
-    fontface = "bold",
-    color = "black",
-    box.padding = 0.5,      # Padding around the text box
-    point.padding = 0.3,    # Distance from the data point
-    force = 2,              # Repulsion force
-    max.overlaps = Inf,     # Ensure all chosen labels are shown
-    segment.color = "grey50", # Color of the pointer line
-    segment.size = 0.5
-  ) +
-  theme(
-    legend.position = "none",
-    plot.title = element_text(face = "bold", hjust = 0.5),
-    plot.subtitle = element_text(hjust = 0.5, size = 10)
+for (mod in target_mods) {
+  mod_entrez <- unique(mod_gene_df$ENTREZID[mod_gene_df$module == mod])
+  if (length(mod_entrez) < 5) next
+  
+  ego <- enrichGO(
+    gene          = mod_entrez,
+    universe      = universe_entrez,
+    OrgDb         = org.Hs.eg.db,
+    ont           = "BP",
+    pAdjustMethod = "BH",
+    pvalueCutoff  = 0.05,
+    qvalueCutoff  = 0.20,
+    readable      = TRUE
   )
-dev.off()
-
-# Choose your hub gene of interest (replace with your target, e.g., "INS", "GCG", "PDX1")
-gene_of_interest <- "ATP6V1A" 
-
-# Check if the gene exists in your dataset
-if (!(gene_of_interest %in% colnames(datExpr_clean))) {
-  stop(paste("Gene", gene_of_interest, "not found in datExpr_clean columns! Check spelling or gene symbols."))
+  
+  if (!is.null(ego) && nrow(as.data.frame(ego)) > 0) {
+    df_go <- as.data.frame(ego)
+    df_go$module <- mod
+    go_list[[mod]] <- df_go
+  }
+  
+  ekegg <- tryCatch(
+    enrichKEGG(
+      gene          = mod_entrez,
+      universe      = universe_entrez,
+      organism      = "hsa",
+      keyType       = "kegg",
+      pAdjustMethod = "BH",
+      pvalueCutoff  = 0.05,
+      qvalueCutoff  = 0.20
+    ),
+    error = function(e) {
+      message("KEGG skipped for module ", mod, ": ", e$message)
+      NULL
+    }
+  )
+  
+  if (!is.null(ekegg) && nrow(as.data.frame(ekegg)) > 0) {
+    df_kegg <- as.data.frame(ekegg)
+    df_kegg$module <- mod
+    kegg_list[[mod]] <- df_kegg
+  }
 }
 
-# Create a data frame combining expression values and clinical status
-gene_expr_df <- data.frame(
-  Expression = datExpr_clean[, gene_of_interest],
-  Status = factor(traits_clean$status, levels = c("ND", "IFG", "IGT", "T2D", "T3cD"))
+go_all_df   <- bind_rows(go_list)
+kegg_all_df <- bind_rows(kegg_list)
+
+cat("Total enriched GO:BP rows across target modules:", nrow(go_all_df), "\n")
+cat("Total enriched KEGG rows across target modules:", nrow(kegg_all_df), "\n")
+
+if (nrow(go_all_df) > 0) {
+  print(
+    go_all_df %>%
+      group_by(module) %>%
+      slice_min(order_by = p.adjust, n = 5, with_ties = FALSE) %>%
+      select(module, ID, Description, Count, p.adjust)
+  )
+}
+
+if (nrow(kegg_all_df) > 0) {
+  print(
+    kegg_all_df %>%
+      group_by(module) %>%
+      slice_min(order_by = p.adjust, n = 5, with_ties = FALSE) %>%
+      select(module, ID, Description, Count, p.adjust)
+  )
+}
+
+# 4. Dotplot for top GO:BP terms across modules (if any enriched)
+if (nrow(go_all_df) > 0) {
+  top_go_plot <- go_all_df %>%
+    group_by(module) %>%
+    slice_min(order_by = p.adjust, n = 6, with_ties = FALSE) %>%
+    ungroup()
+  
+  p_go <- ggplot(
+    top_go_plot,
+    aes(x = module, y = reorder(Description, -log10(p.adjust)), size = Count, color = -log10(p.adjust))
+  ) +
+    geom_point() +
+    scale_color_viridis_c(option = "C") +
+    labs(
+      title = "GO Biological Process Enrichment in Key WGCNA Modules",
+      x     = "WGCNA Module",
+      y     = NULL,
+      color = "-log10(padj)",
+      size  = "Gene Count"
+    ) +
+    theme_bw(base_size = 11)
+  
+  ggsave("GSE164416_WGCNA_GO_BP_Dotplot.png", p_go, width = 10, height = 8, dpi = 300)
+}
+
+#Extract Top Hub Genes per Module in R
+
+kME_df <- signedKME(datExpr_clean, MEs, outputColumnName = "kME_")
+target_mods <- intersect(c("brown", "turquoise", "blue", "yellow"), unique(net$colors))
+
+hub_genes_df <- bind_rows(lapply(target_mods, function(mod) {
+  mod_genes <- colnames(datExpr_clean)[net$colors == mod]
+  kme_col   <- paste0("kME_", mod)
+  
+  # Fallback if eigengene columns use MEbrown instead of kME_brown
+  if (!kme_col %in% colnames(kME_df)) {
+    alt_col <- paste0("ME", mod)
+    if (alt_col %in% colnames(kME_df)) {
+      kme_col <- alt_col
+    } else {
+      stop("Could not find kME column for module: ", mod)
+    }
+  }
+  
+  data.frame(
+    gene   = mod_genes,
+    module = rep(mod, length(mod_genes)),
+    kME    = as.numeric(kME_df[mod_genes, kme_col]),
+    stringsAsFactors = FALSE
+  ) %>%
+    arrange(desc(abs(kME))) %>%
+    slice_head(n = 15)
+}))
+
+print(as_tibble(hub_genes_df), n = 60)
+# Map Ensembl Hub IDs to Gene Symbols
+# 1. Annotate hub_genes_df using dplyr::select() explicitly
+hub_clean_ids <- sub("\\.[0-9]+$", "", hub_genes_df$gene)
+sym_map <- bitr(
+  unique(hub_clean_ids),
+  fromType = "ENSEMBL",
+  toType   = c("SYMBOL", "ENTREZID"),
+  OrgDb    = org.Hs.eg.db
+) %>%
+  dplyr::distinct(ENSEMBL, .keep_all = TRUE)
+
+hub_annotated <- hub_genes_df %>%
+  dplyr::mutate(clean_id = hub_clean_ids) %>%
+  dplyr::left_join(sym_map, by = c("clean_id" = "ENSEMBL")) %>%
+  dplyr::select(gene, SYMBOL, module, kME, ENTREZID)
+
+cat("--- Top Hub Genes per Module (Annotated) ---\n")
+print(as_tibble(hub_annotated), n = 60)
+
+# Optional: order cleanly by module and |kME| before saving
+hub_to_save <- hub_annotated %>%
+  dplyr::arrange(module, dplyr::desc(abs(kME)))
+
+# 1. Save human-readable CSV (no row numbers)
+write.csv(hub_to_save, "GSE164416_WGCNA_top60_hub_genes.csv", row.names = FALSE)
+
+# 2. Save R object (preserves exact column types for downstream R scripts)
+saveRDS(hub_to_save, "GSE164416_WGCNA_top60_hub_genes.rds")
+
+# 2. Pairwise DESeq2: T2D vs. ND (reference = "ND")
+keep_idx <- which(as.character(metadata_cl$status) %in% c("ND", "T2D"))
+meta_pair <- metadata_cl[keep_idx, , drop = FALSE]
+meta_pair$status <- factor(as.character(meta_pair$status), levels = c("ND", "T2D"))
+
+counts_pair <- counts_matrix[, rownames(meta_pair), drop = FALSE]
+stopifnot(all(colnames(counts_pair) == rownames(meta_pair)))
+
+dds_pair <- DESeqDataSetFromMatrix(
+  countData = round(as.matrix(counts_pair)),
+  colData   = meta_pair,
+  design    = ~ status
 )
 
-# Perform One-Way ANOVA to test overall significance across stages
-anova_fit <- aov(Expression ~ Status, data = gene_expr_df)
-anova_summary <- summary(anova_fit)
-print(anova_summary)
+keep_genes <- rowSums(counts(dds_pair) >= 10) >= ceiling(0.2 * ncol(dds_pair))
+dds_pair <- dds_pair[keep_genes, ]
+dds_pair <- DESeq(dds_pair)
 
-# Perform Tukey's HSD Post-Hoc Test for pairwise group comparisons
-tukey_results <- TukeyHSD(anova_fit)
-print(tukey_results)
+res_t2d_nd <- results(dds_pair, contrast = c("status", "T2D", "ND"), alpha = 0.05)
 
-# Calculate summary statistics (mean, SD, median) per stage for reporting
-stage_stats <- gene_expr_df %>%
-  group_by(Status) %>%
-  summarise(
-    Mean_Expr = mean(Expression),
-    SD_Expr = sd(Expression),
-    Median_Expr = median(Expression),
-    IQR_Expr = IQR(Expression),
-    Count = n()
+# Map all tested genes to symbols for readable DE summaries
+res_clean_ids <- sub("\\.[0-9]+$", "", rownames(res_t2d_nd))
+all_sym_map <- bitr(
+  unique(res_clean_ids),
+  fromType = "ENSEMBL",
+  toType   = c("SYMBOL", "ENTREZID"),
+  OrgDb    = org.Hs.eg.db
+) %>%
+  dplyr::distinct(ENSEMBL, .keep_all = TRUE)
+
+res_deseq2_df <- as.data.frame(res_t2d_nd) %>%
+  tibble::rownames_to_column("gene_id") %>%
+  dplyr::mutate(clean_id = res_clean_ids) %>%
+  dplyr::left_join(all_sym_map, by = c("clean_id" = "ENSEMBL")) %>%
+  dplyr::arrange(padj, pvalue)
+
+cat("\nTested genes in T2D vs. ND:", nrow(res_deseq2_df), "\n")
+cat("Significant DEGs (padj < 0.05):", sum(!is.na(res_deseq2_df$padj) & res_deseq2_df$padj < 0.05), "\n")
+print(head(res_deseq2_df %>% dplyr::select(gene_id, SYMBOL, log2FoldChange, pvalue, padj), 15))
+
+# 3. Check overlap between top hub genes and T2D vs. ND DEGs
+hub_de_overlap <- hub_annotated %>%
+  dplyr::left_join(
+    res_deseq2_df %>% dplyr::select(gene_id, log2FoldChange, pvalue, padj),
+    by = c("gene" = "gene_id")
   )
-cat("\n--- Summary Statistics per Stage ---\n")
-print(stage_stats)
 
-# Generate Publication-Quality Boxplot / Violin Plot
-png(paste0("HubGene_Expression_", gene_of_interest, "_5Stages.png"), width = 8, height = 6, units = "in", res = 300)
-ggplot(gene_expr_df, aes(x = Status, y = Expression, fill = Status)) +
-  geom_violin(alpha = 0.4, trim = FALSE) +
-  geom_boxplot(width = 0.2, alpha = 0.7, outlier.shape = NA) +
-  geom_jitter(width = 0.2, size = 1.8, alpha = 0.6) +
-  theme_bw(base_size = 14) +
-  scale_fill_brewer(palette = "Set2") +
-  labs(
-    title = paste("Expression Trajectory of Hub Gene:", gene_of_interest),
-    subtitle = "Comparison Across 5 Islet Phenotype Stages (ND -> IFG -> IGT -> T2D -> T3cD)",
-    x = "Islet Phenotype Stage",
-    y = "Normalized Expression Value"
-  ) +
-  theme(
-    legend.position = "none",
-    plot.title = element_text(face = "bold", hjust = 0.5),
-    plot.subtitle = element_text(hjust = 0.5, size = 10)
+cat("\n--- Hub Genes With T2D vs. ND DESeq2 Stats ---\n")
+print(as_tibble(hub_de_overlap), n = 60)
+
+
+# 1. Save hub + DESeq2 overlap table
+write.csv(hub_de_overlap, "GSE164416_HubGenes_T2D_vs_ND_DESeq2.csv", row.names = FALSE)
+
+# 2. Pairwise T2D vs. ND DE heatmap (top 50 DEGs by padj)
+top_deg_ids <- res_deseq2_df %>%
+  dplyr::filter(!is.na(padj)) %>%
+  dplyr::slice_min(order_by = padj, n = 50, with_ties = FALSE) %>%
+  dplyr::pull(gene_id)
+
+vsd_pair <- vst(dds_pair, blind = FALSE)
+deg_mat  <- assay(vsd_pair)[top_deg_ids, , drop = FALSE]
+
+col_ord <- order(meta_pair$status)
+ann_col_pair <- data.frame(
+  status = meta_pair$status[col_ord],
+  row.names = colnames(deg_mat)[col_ord]
+)
+
+row_labels_sym <- res_deseq2_df$SYMBOL[match(rownames(deg_mat), res_deseq2_df$gene_id)]
+row_labels_use <- ifelse(is.na(row_labels_sym) | row_labels_sym == "", rownames(deg_mat), row_labels_sym)
+
+pheatmap(
+  deg_mat[, col_ord, drop = FALSE],
+  scale          = "row",
+  color          = colorRampPalette(c("#2166AC", "#F7F7F7", "#B2182B"))(100),
+  breaks         = seq(-2.5, 2.5, length.out = 101),
+  cluster_cols   = FALSE,
+  cluster_rows   = TRUE,
+  show_colnames  = FALSE,
+  show_rownames  = TRUE,
+  labels_row     = row_labels_use,
+  annotation_col = ann_col_pair,
+  border_color   = NA,
+  fontsize_row   = 8,
+  main           = "Top 50 DEGs: T2D vs. ND (DESeq2)",
+  filename       = "GSE164416_DE_Heatmap_T2D_vs_ND.png",
+  width          = 10,
+  height         = 9
+)
+
+# 3. GO:BP & KEGG enrichment on significant T2D vs. ND DEGs
+clean_ids <- function(x) sub("\\.[0-9]+$", "", as.character(x))
+tested_clean <- unique(clean_ids(res_deseq2_df$gene_id))
+id_type_pair <- if (mean(grepl("^ENSG", tested_clean)) > 0.5) "ENSEMBL" else "SYMBOL"
+
+deg_sig_clean <- unique(clean_ids(
+  res_deseq2_df %>%
+    dplyr::filter(!is.na(padj), padj < 0.05) %>%
+    dplyr::pull(gene_id)
+))
+
+map_pair <- bitr(
+  tested_clean,
+  fromType = id_type_pair,
+  toType   = c("ENTREZID", "SYMBOL"),
+  OrgDb    = org.Hs.eg.db
+) %>%
+  dplyr::distinct(.data[[id_type_pair]], .keep_all = TRUE)
+
+universe_pair <- unique(na.omit(map_pair$ENTREZID))
+deg_entrez    <- unique(na.omit(map_pair$ENTREZID[map_pair[[id_type_pair]] %in% deg_sig_clean]))
+
+cat("Total significant DEGs (padj < 0.05):", length(deg_sig_clean),
+    "| Mapped to Entrez:", length(deg_entrez), "\n")
+
+if (length(deg_entrez) >= 5) {
+  ego_t2d_nd <- enrichGO(
+    gene          = deg_entrez,
+    universe      = universe_pair,
+    OrgDb         = org.Hs.eg.db,
+    ont           = "BP",
+    pAdjustMethod = "BH",
+    pvalueCutoff  = 0.05,
+    qvalueCutoff  = 0.20,
+    readable      = TRUE
   )
-dev.off()
+  
+  ego_t2d_nd_simp <- tryCatch(
+    simplify(ego_t2d_nd, cutoff = 0.7, by = "p.adjust", select_fun = min),
+    error = function(e) ego_t2d_nd
+  )
+  
+  ekegg_t2d_nd <- tryCatch(
+    enrichKEGG(
+      gene          = deg_entrez,
+      universe      = universe_pair,
+      organism      = "hsa",
+      keyType       = "kegg",
+      pAdjustMethod = "BH",
+      pvalueCutoff  = 0.05,
+      qvalueCutoff  = 0.20
+    ),
+    error = function(e) NULL
+  )
+  
+  cat("\n--- Top Simplified GO:BP Terms (T2D vs. ND DEGs) ---\n")
+  print(head(as.data.frame(ego_t2d_nd_simp)[, c("ID", "Description", "Count", "p.adjust")], 15))
+  
+  if (!is.null(ekegg_t2d_nd) && nrow(as.data.frame(ekegg_t2d_nd)) > 0) {
+    cat("\n--- Top KEGG Pathways (T2D vs. ND DEGs) ---\n")
+    print(head(as.data.frame(ekegg_t2d_nd)[, c("ID", "Description", "Count", "p.adjust")], 15))
+  }
+}
 
+
+# 1. Export DESeq2 results table (T2D vs. ND)
+write.csv(res_deseq2_df, "GSE164416_DESeq2_T2D_vs_ND_all_tested.csv", row.names = FALSE)
+saveRDS(res_deseq2_df, "GSE164416_DESeq2_T2D_vs_ND_all_tested.rds")
+
+# Optional: also save a filtered significant DEGs CSV (padj < 0.05)
+deg_sig_df <- res_deseq2_df %>%
+  dplyr::filter(!is.na(padj), padj < 0.05)
+write.csv(deg_sig_df, "GSE164416_DESeq2_T2D_vs_ND_sig_padj0.05.csv", row.names = FALSE)
+
+# 2. Export simplified GO:BP enrichment table (handle enrichResult or data.frame)
+ego_t2d_nd_df <- if (inherits(ego_t2d_nd_simp, "data.frame")) {
+  ego_t2d_nd_simp
+} else {
+  as.data.frame(ego_t2d_nd_simp)
+}
+write.csv(ego_t2d_nd_df, "GSE164416_DE_T2D_vs_ND_GO_BP_simplified.csv", row.names = FALSE)
+saveRDS(ego_t2d_nd_simp, "GSE164416_DE_T2D_vs_ND_GO_BP_simplified.rds")
+
+# 3. Export KEGG enrichment table (handle enrichResult or data.frame)
+ekegg_t2d_nd_df <- if (is.null(ekegg_t2d_nd)) {
+  data.frame()
+} else if (inherits(ekegg_t2d_nd, "data.frame")) {
+  ekegg_t2d_nd
+} else {
+  as.data.frame(ekegg_t2d_nd)
+}
+write.csv(ekegg_t2d_nd_df, "GSE164416_DE_T2D_vs_ND_KEGG.csv", row.names = FALSE)
+saveRDS(ekegg_t2d_nd, "GSE164416_DE_T2D_vs_ND_KEGG.rds")
+
+cat("Exported CSV and RDS files for DESeq2, simplified GO:BP, and KEGG.\n")
+
+markers <- c("ALDOB", "SLC2A2", "DKK3", "PCOLCE2", "TMEM37", "SAA1")
+
+res_deseq2_df %>%
+  dplyr::filter(SYMBOL %in% markers) %>%
+  dplyr::select(gene_id, SYMBOL, baseMean, log2FoldChange, lfcSE, pvalue, padj) %>%
+  dplyr::arrange(padj)
